@@ -1,0 +1,51 @@
+[project]
+name = "donors"
+version = "0.1.0"
+description = "Donor selection from recurrent parents as a discrete k-center problem"
+readme = "README.md"
+authors = [
+    { name = "Ben Shouse", email = "shousebb@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.5.3",
+    "ortools>=9.15.6755",
+    "z3-solver>=5.1.0.0",
+]
+
+[project.scripts]
+donors = "donors.donor:main"
+
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "donors._core"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.40.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.10",
+    "ty>=0.0.84",
+]
+
+[tool.uv]
+# Rebuild the Rust extension when its sources change, not only pyproject.toml
+cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "src/**/*.rs" }]
+
+
+[tool.basedpyright]
+venvPath = "."
+venv = ".venv"
+# Builder APIs (argparse add_argument, CP-SAT add) return objects we deliberately ignore
+reportUnusedCallResult = false
+# Third-party typing gaps: z3 ships no stubs; numpy reductions (.max(), .min()) return Any
+reportMissingTypeStubs = false
+reportAny = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
