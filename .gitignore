@@ -13,3 +13,14 @@ wheels/
 /target
 
 *.so
+
+
+# File types to ignore
+*.csv
+*.parquet
+*.json
+*.xlsx
+
+
+# Secrets
+.env
