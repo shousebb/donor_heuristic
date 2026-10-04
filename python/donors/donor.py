@@ -14,11 +14,13 @@ early-stopping patience. Z3 verifies the final cover. A CP-SAT model
 Usage: uv run donors [scenario.toml]
 """
 
+import json
 import math
 import sys
 import time
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -265,7 +267,8 @@ def solve_alns(
     runs: int = 4,
     seed: int = 0,
     scale: int = SCALE,
-) -> tuple[list[int], float, float]:
+    max_sets: int = 1,
+) -> tuple[list[int], float, float, list[list[int]]]:
     """Rust ALNS from `start` (k = len(start)): `runs` parallel searches, best kept.
 
     Each run stops after `max_iters` iterations, `patience` iterations without
@@ -273,6 +276,10 @@ def solve_alns(
     Destroys a few donors per iteration (random, nearest the bottleneck parent,
     or related), repairs greedily with swap descent, and accepts by simulated
     annealing. Heuristic, no lower bound.
+
+    Returns (selected donors, tau, lower bound 0, sets): `sets` holds up to
+    `max_sets` distinct donor sets the search found at that same tau, fewest
+    parents at tau first; sets[0] is `selected`.
     """
     d = to_units(d, scale)
     result = _core.optimize(
@@ -284,10 +291,17 @@ def solve_alns(
         time_limit_s=time_limit,
         seed=seed,
         runs=runs,
+        max_sets=max_sets,
     )
     run_taus = ", ".join(f"{t / scale:.4f}" for t in result["run_taus"])
-    status = f"run iterations {result['run_iters']}, run taus [{run_taus}]"
-    return report("alns", d, result["donors"], status, 0, result["wall"], scale)
+    status = (
+        f"run iterations {result['run_iters']}, run taus [{run_taus}], "
+        f"sets at tau {len(result['sets'])}"
+    )
+    selected, tau, lower = report(
+        "alns", d, result["donors"], status, 0, result["wall"], scale
+    )
+    return selected, tau, lower, result["sets"]
 
 
 def verify(
@@ -329,6 +343,7 @@ class Solver:
     time_limit: float = math.inf
     seed: int = 0
     scale: int = SCALE  # distances solved in integer units of 1 / scale (<= 65 535)
+    max_sets: int = 10  # distinct donor sets to report at the best tau
 
 
 @dataclass(frozen=True)
@@ -345,6 +360,39 @@ class Scenario:
         return cls(Data(**cfg.get("data", {})), Solver(**cfg.get("solver", {})))
 
 
+def write_output(
+    scenario_path: Path,
+    scenario: Scenario,
+    result: dict[str, object],
+    out_root: Path | None = None,
+) -> Path:
+    """Write the scenario and result to <out_root>/<scenario stem>_<YYYYMMDD>/result.json.
+
+    out_root defaults to ./outputs.
+
+    A rerun on the same day overwrites it. An infinite time_limit is written as null.
+    """
+    solver = {
+        key: None if value == math.inf else value
+        for key, value in asdict(scenario.solver).items()
+    }
+    out_dir = (
+        out_root or Path("outputs")
+    ) / f"{scenario_path.stem}_{datetime.now().astimezone():%Y%m%d}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "result.json"
+    payload = {
+        "scenario": {
+            "file": str(scenario_path),
+            "data": asdict(scenario.data),
+            "solver": solver,
+        },
+        "result": result,
+    }
+    out.write_text(json.dumps(payload, indent=2) + "\n")
+    return out
+
+
 def main() -> None:
     path = Path(sys.argv[1] if len(sys.argv) > 1 else "scenario.toml")
     scenario = Scenario.load(path)
@@ -355,7 +403,7 @@ def main() -> None:
     start, start_tau, _ = solve_heuristic(
         distances, solver.donors, seeds=solver.seeds, scale=solver.scale
     )
-    selected, tau, _ = solve_alns(
+    _, tau, _, sets = solve_alns(
         distances,
         start,
         max_iters=solver.max_iters,
@@ -364,13 +412,34 @@ def main() -> None:
         runs=solver.runs,
         seed=solver.seed,
         scale=solver.scale,
+        max_sets=solver.max_sets,
     )
     print(f"alns tau is {1 - tau / start_tau:.1%} below the heuristic")
-    print(f"donors={sorted(selected)}, tau={tau:.4f}")
-    assert verify(distances, selected, tau, solver.donors, solver.scale), (
-        "z3: the final cover leaves a parent uncovered"
+    d = to_units(distances, solver.scale)
+    at_tau = [
+        int((d[:, s].min(axis=1) == round(tau * solver.scale)).sum()) for s in sets
+    ]
+    print(f"{len(sets)} donor sets at tau={tau:.4f}, fewest parents at tau first:")
+    for donors, count in zip(sets, at_tau, strict=True):
+        print(f"  {donors} ({count} parents at tau)")
+        assert verify(distances, donors, tau, solver.donors, solver.scale), (
+            f"z3: donor set {donors} leaves a parent uncovered"
+        )
+    print("z3: every set covers all parents within tau")
+
+    out = write_output(
+        path,
+        scenario,
+        {
+            "heuristic_tau": start_tau,
+            "tau": tau,
+            "sets": [
+                {"donors": donors, "parents_at_tau": count}
+                for donors, count in zip(sets, at_tau, strict=True)
+            ],
+        },
     )
-    print("z3: all parents covered within tau")
+    print(f"wrote {out}")
 
 
 if __name__ == "__main__":

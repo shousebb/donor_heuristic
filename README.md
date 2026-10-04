@@ -33,9 +33,11 @@ cluster structure, so many donor sets are nearly as good as the best.
    close), repairs greedily, runs swap descent, and accepts by simulated annealing.
    Each run stops after `max_iters` iterations (default 1 000 000) or `patience`
    iterations without a new best (default 100 000), whichever comes first; an
-   optional `time_limit` caps its seconds.
-3. **Z3:** verifies that the final cover uses at most `donors` donors and covers every
-   parent within `tau`.
+   optional `time_limit` caps its seconds. Every run also keeps the distinct donor
+   sets it meets at its best `tau`; those at the overall best `tau` are merged and up to
+   `max_sets` are reported, fewest parents at `tau` first.
+3. **Z3:** verifies that each reported set uses at most `donors` donors and covers
+   every parent within `tau`.
 
 The heuristics give an upper bound only. A CP-SAT radius-level model
 (`solve_cpsat`) remains in `donor.py` for lower bounds but is not part of the
@@ -50,6 +52,11 @@ builds the Rust extension automatically.
 uv run donors                    # reads ./scenario.toml
 uv run donors my_scenario.toml   # another scenario
 ```
+
+Each run writes the scenario and its result (heuristic tau, final tau, and each donor
+set with its number of parents at tau) to `outputs/<scenario name>_<YYYYMMDD>/result.json`,
+e.g. `outputs/scenario_20261004/result.json`; a rerun on the same day overwrites it.
+`outputs/` is git-ignored.
 
 A scenario has a `[data]` and a `[solver]` table; omitted keys use the defaults and
 unknown keys are an error. See `scenario.toml`:
@@ -69,6 +76,7 @@ max_iters = 1_000_000  # iterations per ALNS run
 patience = 100_000     # stop a run after this many iterations without a new best
 seed = 0               # ALNS seed (run r uses seed + r)
 scale = 100            # distances solved in integer units of 1 / scale (100 -> 0.01; max 65_535)
+max_sets = 10          # distinct donor sets to report at the best tau
 # time_limit = 600     # optional seconds per run (default: no limit)
 ```
 
@@ -79,8 +87,10 @@ from donors.donor import get_distances, solve_alns, solve_heuristic, verify
 
 d = get_distances(n=2000, mu=0.7, sigma=0.08, bounds=(0, 1))
 start, _, _ = solve_heuristic(d, k=10)
-donors, tau, _ = solve_alns(d, start, max_iters=1_000_000, patience=100_000)
-assert verify(d, donors, tau, k=10)
+donors, tau, _, sets = solve_alns(
+    d, start, max_iters=1_000_000, patience=100_000, max_sets=10
+)
+assert all(verify(d, s, tau, k=10) for s in sets)  # sets[0] == donors
 ```
 
 ## Results (n = 2000, k = 10)

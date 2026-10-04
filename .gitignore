@@ -13,3 +13,6 @@ wheels/
 /target
 
 *.so
+
+# Solver results
+/outputs

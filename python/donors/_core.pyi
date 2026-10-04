@@ -24,6 +24,9 @@ class OptimizeResult(TypedDict):
     """Best run's tau (scaled units)."""
     count: int
     """Best run's number of parents at tau."""
+    sets: list[list[int]]
+    """Distinct sorted donor sets at tau from all runs, at most max_sets, ordered by
+    parents at tau; the first is `donors`."""
     init_tau: int
     """tau of the initial donors after swap descent."""
     iters: int
@@ -57,16 +60,19 @@ def optimize(
     time_limit_s: float = ...,
     seed: int = 0,
     runs: int = 1,
+    max_sets: int = 1,
     config: dict[str, float] | None = None,
 ) -> OptimizeResult:
     """`runs` parallel ALNS searches from `init` (k = len(init)); returns the best.
 
     Run r uses seed `seed + r` and stops after `max_iters` iterations,
     `patience` iterations without a new best (0 = off), or `time_limit_s`
-    seconds (default: no limit), whichever comes first. `config` overrides
+    seconds (default: no limit), whichever comes first. Each run keeps up to
+    `max_sets` distinct donor sets at its best tau; `sets` merges those at the
+    overall best tau. `config` overrides
     tuning: segment, react, score_best, score_better, score_accept, cooling,
     temp_factor, destroy_max.
 
     Raises ValueError unless len(dist) == 2 * n * n, init holds 1..n-1 indices
-    below n, and runs >= 1.
+    below n, runs >= 1 and max_sets >= 1.
     """

@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -113,11 +114,37 @@ def test_heuristic_is_deterministic(distances: Distances):
 
 def test_alns_reaches_optimum(distances: Distances, optimum: float):
     start, _, _ = solve_heuristic(distances, K, seeds=1)
-    selected, tau, _ = solve_alns(
+    selected, tau, _, sets = solve_alns(
         distances, start, max_iters=20_000, patience=5_000, runs=2
     )
     assert verify(distances, selected, tau, K)
     assert tau == optimum
+    assert sets == [selected]
+
+
+def test_alns_finds_distinct_sets_at_optimum(distances: Distances, optimum: float):
+    start, _, _ = solve_heuristic(distances, K, seeds=1)
+    selected, tau, _, sets = solve_alns(
+        distances, start, max_iters=20_000, patience=5_000, runs=2, max_sets=20
+    )
+    assert tau == optimum
+    assert sets[0] == selected
+    assert 1 < len(sets) <= 20
+    assert len({tuple(s) for s in sets}) == len(sets)
+    for donors in sets:
+        assert donors == sorted(donors) and len(set(donors)) == K
+        assert verify(distances, donors, tau, K)
+        assert radius(to_units(distances), donors) / SCALE == tau
+
+
+def test_optimize_sets_are_ordered_by_parents_at_tau(distances: Distances):
+    d = to_units(distances)
+    start = list(range(K))
+    result = _core.optimize(to_bytes(d), len(d), start, max_iters=5_000, max_sets=50)
+    counts = [int((d[:, s].min(axis=1) == result["tau"]).sum()) for s in result["sets"]]
+    assert result["sets"][0] == result["donors"]
+    assert counts[0] == result["count"]
+    assert counts == sorted(counts)
 
 
 def test_optimize_reports_every_run(distances: Distances):
@@ -168,6 +195,8 @@ def test_rust_rejects_bad_input(distances: Distances):
         _core.optimize(to_bytes(d), len(d), [len(d)])
     with pytest.raises(ValueError):
         _core.optimize(to_bytes(d), len(d), [0], runs=0)
+    with pytest.raises(ValueError):
+        _core.optimize(to_bytes(d), len(d), [0], max_sets=0)
 
 
 # CP-SAT
@@ -232,6 +261,16 @@ patience = 500
 scale = 10_000
 """)
     monkeypatch.setattr(sys, "argv", ["donors", str(path)])
+    monkeypatch.chdir(tmp_path)
     main()
     out = capsys.readouterr().out
-    assert "z3: all parents covered within tau" in out
+    assert "z3: every set covers all parents within tau" in out
+
+    (result_file,) = (tmp_path / "outputs").glob("scenario_*/result.json")
+    saved = json.loads(result_file.read_text())
+    assert saved["scenario"]["data"]["parents"] == 30
+    assert saved["scenario"]["solver"]["time_limit"] is None
+    result = saved["result"]
+    assert result["tau"] <= result["heuristic_tau"]
+    counts = [s["parents_at_tau"] for s in result["sets"]]
+    assert counts == sorted(counts) and counts[0] >= 1

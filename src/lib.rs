@@ -12,7 +12,7 @@
 // alns_rs.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
 use pyo3::exceptions::PyValueError;
@@ -223,9 +223,40 @@ fn destroy(op: usize, dist: &Dist, sel: &mut Vec<usize>, rng: &mut XorShiftRng, 
     sel.drain(..q);
 }
 
+/// Distinct donor sets (sorted) sharing the lowest tau seen so far, at most `cap`.
+struct Pool {
+    tau: u16,
+    cap: usize,
+    sets: BTreeSet<Vec<usize>>,
+}
+
+impl Pool {
+    fn new(cap: usize) -> Self {
+        Pool {
+            tau: u16::MAX,
+            cap,
+            sets: BTreeSet::new(),
+        }
+    }
+
+    /// Keep `sel` if it ties the lowest tau; a lower tau empties the pool first.
+    fn record(&mut self, sel: &[usize], tau: u16) {
+        if tau < self.tau {
+            self.tau = tau;
+            self.sets.clear();
+        }
+        if tau == self.tau && self.sets.len() < self.cap {
+            let mut set = sel.to_vec();
+            set.sort_unstable();
+            self.sets.insert(set);
+        }
+    }
+}
+
 struct Outcome {
     donors: Vec<usize>,
     score: Score,
+    pool: Pool,
     init_tau: u16,
     iters: u64,
     wall: f64,
@@ -240,7 +271,14 @@ struct Limits {
     time_s: f64,    // wall-clock cap in seconds
 }
 
-fn alns(dist: &Dist, init: Vec<usize>, limits: Limits, seed: u64, cfg: &Config) -> Outcome {
+fn alns(
+    dist: &Dist,
+    init: Vec<usize>,
+    limits: Limits,
+    seed: u64,
+    cfg: &Config,
+    max_sets: usize,
+) -> Outcome {
     let k = init.len();
     let mut rng = XorShiftRng::seed_from_u64(seed);
     // Energy for annealing: tau plus count as a fraction, preserving the lexicographic order
@@ -250,6 +288,8 @@ fn alns(dist: &Dist, init: Vec<usize>, limits: Limits, seed: u64, cfg: &Config) 
     let mut cur = swap_descent(dist, &mut cur_sel);
     let init_tau = cur.0;
     let (mut best_sel, mut best) = (cur_sel.clone(), cur);
+    let mut pool = Pool::new(max_sets);
+    pool.record(&cur_sel, cur.0);
 
     let mut temp = (cur.0 as f64 * cfg.temp_factor).max(1.0);
     let mut weights = [1.0f64; 3];
@@ -282,6 +322,7 @@ fn alns(dist: &Dist, init: Vec<usize>, limits: Limits, seed: u64, cfg: &Config) 
         let mut sel = cur_sel.clone();
         destroy(op, dist, &mut sel, &mut rng, q);
         let new = repair(dist, &mut sel, k);
+        pool.record(&sel, new.0);
 
         let delta = energy(new) - energy(cur);
         if delta <= 0.0 || rand_f64(&mut rng) < (-delta / temp).exp() {
@@ -316,9 +357,11 @@ fn alns(dist: &Dist, init: Vec<usize>, limits: Limits, seed: u64, cfg: &Config) 
     }
     progress.push((it, cur.0, best.0));
     best_sel.sort_unstable();
+    pool.sets.insert(best_sel.clone()); // the best may arrive after the pool is full
     Outcome {
         donors: best_sel,
         score: best,
+        pool,
         init_tau,
         iters: it,
         wall: start.elapsed().as_secs_f64(),
@@ -398,18 +441,39 @@ fn construct(
     Ok(dict.into())
 }
 
+/// Distinct donor sets at the best tau over all runs, by (parents at tau, donors),
+/// at most `max_sets`. The first is the overall best.
+fn merge_sets(dist: &Dist, outcomes: &[Outcome], max_sets: usize) -> Vec<Vec<usize>> {
+    let tau = outcomes.iter().map(|o| o.pool.tau).min().unwrap();
+    let union: BTreeSet<&Vec<usize>> = outcomes
+        .iter()
+        .filter(|o| o.pool.tau == tau)
+        .flat_map(|o| &o.pool.sets)
+        .collect();
+    let mut sets: Vec<(Score, &Vec<usize>)> = union
+        .into_iter()
+        .map(|s| (score(&dist.nearest(s)), s))
+        .collect();
+    sets.sort_unstable();
+    sets.into_iter()
+        .take(max_sets)
+        .map(|(_, s)| s.clone())
+        .collect()
+}
+
 /// `runs` parallel ALNS searches (seeds seed..seed + runs) from the initial donors
 /// `init` (k = len(init)); returns the best. Each run stops after `max_iters`
 /// iterations, `patience` iterations without a new best (0 = off), or `time_limit_s`
-/// seconds, whichever comes first.
+/// seconds, whichever comes first. Each run also keeps up to `max_sets` distinct donor
+/// sets at its best tau; those at the overall best tau are merged into `sets`.
 ///
 /// `dist` is the n x n distance matrix as little-endian u16 bytes. Returns a dict with
-/// donors, tau, count (parents at tau), init_tau, iters (all runs), wall, run_taus,
-/// run_iters and progress [(iteration, current tau, best tau)] of the best run.
+/// donors, tau, count (parents at tau), sets, init_tau, iters (all runs), wall,
+/// run_taus, run_iters and progress [(iteration, current tau, best tau)] of the best run.
 #[pyfunction]
 #[pyo3(signature = (
     dist, n, init, max_iters=1_000_000, patience=100_000, time_limit_s=f64::INFINITY,
-    seed=0, runs=1, config=None,
+    seed=0, runs=1, max_sets=1, config=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn optimize(
@@ -422,6 +486,7 @@ fn optimize(
     time_limit_s: f64,
     seed: u64,
     runs: u64,
+    max_sets: usize,
     config: Option<HashMap<String, f64>>,
 ) -> PyResult<PyObject> {
     let limits = Limits {
@@ -430,9 +495,14 @@ fn optimize(
         time_s: time_limit_s,
     };
     let dist = parse_dist(dist, n)?;
-    if init.is_empty() || init.len() >= n || init.iter().any(|&i| i >= n) || runs == 0 {
+    if init.is_empty()
+        || init.len() >= n
+        || init.iter().any(|&i| i >= n)
+        || runs == 0
+        || max_sets == 0
+    {
         return Err(PyValueError::new_err(
-            "init must hold 1..n-1 donor indices below n, and runs >= 1",
+            "init must hold 1..n-1 donor indices below n, runs >= 1 and max_sets >= 1",
         ));
     }
     let cfg = Config::from_map(config);
@@ -441,7 +511,7 @@ fn optimize(
             let handles: Vec<_> = (0..runs)
                 .map(|r| {
                     let (dist, cfg, init) = (&dist, &cfg, init.clone());
-                    s.spawn(move || alns(dist, init, limits, seed + r, cfg))
+                    s.spawn(move || alns(dist, init, limits, seed + r, cfg, max_sets))
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -450,12 +520,14 @@ fn optimize(
     let run_taus: Vec<u16> = outcomes.iter().map(|o| o.score.0).collect();
     let run_iters: Vec<u64> = outcomes.iter().map(|o| o.iters).collect();
     let iters: u64 = run_iters.iter().sum();
+    let sets = merge_sets(&dist, &outcomes, max_sets);
     let best = outcomes.into_iter().min_by_key(|o| o.score).unwrap();
 
     let dict = pyo3::types::PyDict::new(py);
     dict.set_item("donors", best.donors)?;
     dict.set_item("tau", best.score.0)?;
     dict.set_item("count", best.score.1)?;
+    dict.set_item("sets", sets)?;
     dict.set_item("init_tau", best.init_tau)?;
     dict.set_item("iters", iters)?;
     dict.set_item("run_iters", run_iters)?;
