@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-donors = "donors.donor:main"
+donors = "donors.cli:main"
 
 [build-system]
 requires = ["maturin>=1,<2"]

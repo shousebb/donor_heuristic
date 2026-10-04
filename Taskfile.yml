@@ -28,8 +28,9 @@ tasks:
       - uv run basedpyright
 
   test:
-    desc: Run the pytest suite (uv rebuilds the Rust extension if needed)
+    desc: Run Rust unit tests and the pytest suite (uv rebuilds the extension if needed)
     cmds:
+      - cargo test --release -q
       - uv run pytest -q
 
   fmt:

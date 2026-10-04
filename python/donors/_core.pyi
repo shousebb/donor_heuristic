@@ -1,7 +1,7 @@
 """Type stubs for the Rust extension (src/lib.rs): donor-selection heuristics.
 
 Distances are passed as the n x n matrix of scaled integer distances (units of
-1 / SCALE) encoded as little-endian u16 bytes; see donors.donor.to_bytes.
+1 / scale) encoded as little-endian u16 bytes; see donors.distances.to_bytes.
 Scores are (tau, parents at tau), lexicographic, lower is better.
 """
 
@@ -18,27 +18,29 @@ class ConstructResult(TypedDict):
     """Seconds taken."""
 
 class OptimizeResult(TypedDict):
-    donors: list[int]
-    """Best run's donor indices, sorted."""
-    tau: int
-    """Best run's tau (scaled units)."""
-    count: int
-    """Best run's number of parents at tau."""
     sets: list[list[int]]
-    """Distinct sorted donor sets at tau from all runs, at most max_sets, ordered by
-    parents at tau; the first is `donors`."""
+    """The best max_sets distinct sorted donor sets at the lowest tau over all runs,
+    by (parents at tau, donors)."""
+    counts: list[int]
+    """Parents at tau of each set, ascending."""
+    donors: list[int]
+    """sets[0]."""
+    tau: int
+    """Lowest tau over all runs (scaled units)."""
+    count: int
+    """counts[0]."""
     init_tau: int
-    """tau of the initial donors after swap descent."""
+    """tau of the initial donors after swap descent, in the run that found sets[0]."""
+    wall: float
+    """Seconds taken by the run that found sets[0]."""
+    progress: list[tuple[int, int, int]]
+    """That run's (iteration, current tau, best tau), about every 0.5 s."""
     iters: int
     """ALNS iterations summed over all runs."""
     run_iters: list[int]
     """Iterations of each run, in seed order."""
-    wall: float
-    """Seconds taken by the best run."""
     run_taus: list[int]
     """Final tau of each run, in seed order."""
-    progress: list[tuple[int, int, int]]
-    """Best run's (iteration, current tau, best tau), about every 0.5 s."""
 
 def construct(
     dist: bytes, n: int, k: int, seeds: int = 10, seed: int = 0
@@ -63,16 +65,15 @@ def optimize(
     max_sets: int = 1,
     config: dict[str, float] | None = None,
 ) -> OptimizeResult:
-    """`runs` parallel ALNS searches from `init` (k = len(init)); returns the best.
+    """`runs` parallel ALNS searches from `init` (k = len(init)); returns the best sets.
 
     Run r uses seed `seed + r` and stops after `max_iters` iterations,
     `patience` iterations without a new best (0 = off), or `time_limit_s`
-    seconds (default: no limit), whichever comes first. Each run keeps up to
-    `max_sets` distinct donor sets at its best tau; `sets` merges those at the
-    overall best tau. `config` overrides
-    tuning: segment, react, score_best, score_better, score_accept, cooling,
-    temp_factor, destroy_max.
+    seconds (default: no limit), whichever comes first. Each run keeps its best
+    `max_sets` distinct donor sets at its lowest tau; `sets` merges those at the
+    overall lowest tau. `config` overrides tuning: segment, react, score_best,
+    score_better, score_accept, cooling, temp_factor, destroy_max.
 
     Raises ValueError unless len(dist) == 2 * n * n, init holds 1..n-1 indices
-    below n, runs >= 1 and max_sets >= 1.
+    below n, runs >= 1, max_sets >= 1 and config has no unknown keys.
     """

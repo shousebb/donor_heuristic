@@ -33,14 +33,15 @@ cluster structure, so many donor sets are nearly as good as the best.
    close), repairs greedily, runs swap descent, and accepts by simulated annealing.
    Each run stops after `max_iters` iterations (default 1 000 000) or `patience`
    iterations without a new best (default 100 000), whichever comes first; an
-   optional `time_limit` caps its seconds. Every run also keeps the distinct donor
-   sets it meets at its best `tau`; those at the overall best `tau` are merged and up to
-   `max_sets` are reported, fewest parents at `tau` first.
-3. **Z3:** verifies that each reported set uses at most `donors` donors and covers
-   every parent within `tau`.
+   optional `time_limit` caps its seconds. Every run also keeps its best `max_sets`
+   distinct donor sets at its lowest `tau`; those at the overall lowest `tau` are
+   merged and the best `max_sets` reported, fewest parents at `tau` first (a set with
+   fewer parents exactly at `tau` is closer to a lower `tau`).
+3. **Check:** every reported set is checked to use at most `donors` donors and cover
+   every parent within `tau`; Z3 independently proves it for the best set.
 
 The heuristics give an upper bound only. A CP-SAT radius-level model
-(`solve_cpsat`) remains in `donor.py` for lower bounds but is not part of the
+(`solve_cpsat` in `cpsat.py`) remains for lower bounds but is not part of the
 pipeline.
 
 ## Usage
@@ -54,9 +55,11 @@ uv run donors my_scenario.toml   # another scenario
 ```
 
 Each run writes the scenario and its result (heuristic tau, final tau, and each donor
-set with its number of parents at tau) to `outputs/<scenario name>_<YYYYMMDD>/result.json`,
-e.g. `outputs/scenario_20261004/result.json`; a rerun on the same day overwrites it.
-`outputs/` is git-ignored.
+set with its number of parents at tau) to a new file
+`outputs/<scenario name>_<YYYYMMDD>/result_<HHMMSS>.json`, e.g.
+`outputs/scenario_20261004/result_143012.json`; earlier results are never replaced.
+`outputs/` is git-ignored. Invalid scenario values (e.g. `max_sets = 0`,
+`donors >= parents`) are rejected when the scenario loads.
 
 A scenario has a `[data]` and a `[solver]` table; omitted keys use the defaults and
 unknown keys are an error. See `scenario.toml`:
@@ -82,15 +85,19 @@ max_sets = 10          # distinct donor sets to report at the best tau
 
 From Python:
 
-```python
-from donors.donor import get_distances, solve_alns, solve_heuristic, verify
+Solvers take integer distances (`to_units`) and return a `Solution` whose `tau` is in
+units of 1 / scale:
 
-d = get_distances(n=2000, mu=0.7, sigma=0.08, bounds=(0, 1))
-start, _, _ = solve_heuristic(d, k=10)
-donors, tau, _, sets = solve_alns(
-    d, start, max_iters=1_000_000, patience=100_000, max_sets=10
-)
-assert all(verify(d, s, tau, k=10) for s in sets)  # sets[0] == donors
+```python
+from donors.distances import get_distances, to_units
+from donors.heuristics import solve_alns, solve_heuristic
+from donors.verify import covers
+
+d = to_units(get_distances(n=2000, mu=0.7, sigma=0.08, bounds=(0, 1)), scale=1000)
+start = solve_heuristic(d, k=10)
+best = solve_alns(d, start.donors, max_iters=1_000_000, patience=100_000, max_sets=10)
+print(best.tau / 1000, best.sets, best.counts)  # sets[0] == best.donors
+assert all(covers(d, s, best.tau, k=10) for s in best.sets)
 ```
 
 ## Results (n = 2000, k = 10)
@@ -107,12 +114,18 @@ are weak on this data: bounds based on the linear relaxation can prove at most a
 ## Layout
 
 ```
-Cargo.toml, src/lib.rs        Rust extension donors._core: construct, optimize
+src/search.rs                 Rust search: construction, ALNS, set pool (+ unit tests)
+src/lib.rs                    Python bindings donors._core: construct, optimize
 python/donors/_core.pyi       type stubs for the extension
-python/donors/donor.py        data, scenario, wrappers, Z3 check, CLI (donors)
+python/donors/distances.py    synthetic distances, integer units, radius
+python/donors/heuristics.py   wrappers for the Rust heuristics
+python/donors/cpsat.py        CP-SAT radius-level model (lower bounds)
+python/donors/verify.py       cover checks: numpy and Z3
+python/donors/solution.py     Solution returned by every solver
+python/donors/cli.py          scenario, result output, CLI (donors)
+scripts/measure_windows.py    CP-SAT model size per tau window
 scenario.toml                 default scenario
 tests/test_donors.py          pytest suite
-reference/donor.py            earlier SCIP big-M model (reference only)
 ```
 
 ## Development
@@ -121,7 +134,8 @@ reference/donor.py            earlier SCIP big-M model (reference only)
 uv run pytest                             # tests
 uv run ruff check && uv run ruff format   # lint and format
 uv run ty check && uv run basedpyright    # type checks
-cargo fmt && cargo clippy -- -D warnings  # Rust
+cargo fmt && cargo clippy -- -D warnings  # Rust lint
+cargo test --release                      # Rust unit tests
 ```
 
 `uv` rebuilds the extension when `Cargo.toml` or `src/**/*.rs` change (see
