@@ -7,7 +7,7 @@ from donors import donor
 
 n = 2000
 d = donor.get_distances(n=n, mu=0.7, sigma=0.08, bounds=(0, 1))
-D = donor.scale(d)
+D = donor.to_units(d)
 print(f"levels total: {len(np.unique(D))}")
 for k in (5, 20):
     t = time.perf_counter()

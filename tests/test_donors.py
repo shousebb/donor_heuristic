@@ -1,23 +1,24 @@
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
 from donors import _core
 from donors.donor import (
     SCALE,
+    Data,
+    Scenario,
+    Solver,
     get_distances,
     main,
     nn_lower_bound,
     radius,
-    scale,
     solve_alns,
     solve_cpsat,
     solve_heuristic,
     to_bytes,
+    to_units,
     verify,
-    verify_lower,
-    z3_cover_within,
-    z3_lower_bound,
 )
 from numpy.typing import NDArray
 
@@ -55,8 +56,23 @@ def test_distances_are_reproducible():
 
 
 def test_scale_rounds_to_integer_units():
-    d = scale(np.array([[0.0, 12.4 / SCALE], [12.6 / SCALE, 1.0]]))
+    d = to_units(np.array([[0.0, 12.4 / SCALE], [12.6 / SCALE, 1.0]]))
     assert d.tolist() == [[0, 12], [13, SCALE]]
+
+
+def test_to_units_uses_given_scale():
+    d = np.array([[0.0, 0.12344], [0.12346, 1.0]])
+    assert to_units(d, 10_000).tolist() == [[0, 1234], [1235, 10_000]]
+    assert to_units(d, 100).tolist() == [[0, 12], [12, 100]]
+
+
+def test_finer_scale_resolves_tau_more_precisely(distances: Distances):
+    coarse, coarse_tau, _ = solve_heuristic(distances, K, scale=100)
+    fine, fine_tau, _ = solve_heuristic(distances, K, scale=10_000)
+    assert verify(distances, coarse, coarse_tau, K, scale=100)
+    assert verify(distances, fine, fine_tau, K, scale=10_000)
+    assert round(coarse_tau * 100) == coarse_tau * 100  # multiple of 0.01
+    assert not verify(distances, fine, fine_tau - 1e-4, K, scale=10_000)
 
 
 def test_radius_is_worst_nearest_donor_distance():
@@ -67,7 +83,7 @@ def test_radius_is_worst_nearest_donor_distance():
 
 
 def test_nn_lower_bound_is_valid(distances: Distances, optimum: float):
-    assert nn_lower_bound(scale(distances), K) / SCALE <= optimum
+    assert nn_lower_bound(to_units(distances), K) / SCALE <= optimum
 
 
 def test_to_bytes_rejects_values_beyond_u16():
@@ -97,15 +113,17 @@ def test_heuristic_is_deterministic(distances: Distances):
 
 def test_alns_reaches_optimum(distances: Distances, optimum: float):
     start, _, _ = solve_heuristic(distances, K, seeds=1)
-    selected, tau, _ = solve_alns(distances, start, time_limit=1, runs=2)
+    selected, tau, _ = solve_alns(
+        distances, start, max_iters=20_000, patience=5_000, runs=2
+    )
     assert verify(distances, selected, tau, K)
     assert tau == optimum
 
 
 def test_optimize_reports_every_run(distances: Distances):
-    d = scale(distances)
+    d = to_units(distances)
     start = _core.construct(to_bytes(d), len(d), K, seeds=1)["donors"]
-    result = _core.optimize(to_bytes(d), len(d), start, 0.2, runs=3)
+    result = _core.optimize(to_bytes(d), len(d), start, max_iters=2_000, runs=3)
     assert len(result["run_taus"]) == 3
     assert result["tau"] == min(result["run_taus"])
     assert result["tau"] <= result["init_tau"]
@@ -115,15 +133,31 @@ def test_optimize_reports_every_run(distances: Distances):
 
 
 def test_optimize_accepts_config(distances: Distances):
-    d = scale(distances)
+    d = to_units(distances)
     start = list(range(K))
     config = {"destroy_max": 1, "cooling": 0.99, "segment": 10}
-    result = _core.optimize(to_bytes(d), len(d), start, 0.2, config=config)
+    result = _core.optimize(to_bytes(d), len(d), start, max_iters=500, config=config)
     assert len(result["donors"]) == K
 
 
+def test_optimize_stops_at_max_iters(distances: Distances):
+    d = to_units(distances)
+    result = _core.optimize(
+        to_bytes(d), len(d), list(range(K)), max_iters=300, patience=0
+    )
+    assert result["run_iters"] == [300]
+
+
+def test_optimize_stops_early_without_improvement(distances: Distances):
+    d = to_units(distances)
+    result = _core.optimize(
+        to_bytes(d), len(d), list(range(K)), max_iters=1_000_000, patience=200
+    )
+    assert result["iters"] < 1_000_000
+
+
 def test_rust_rejects_bad_input(distances: Distances):
-    d = scale(distances)
+    d = to_units(distances)
     with pytest.raises(ValueError):
         _core.construct(to_bytes(d)[:-2], len(d), K)
     with pytest.raises(ValueError):
@@ -131,9 +165,9 @@ def test_rust_rejects_bad_input(distances: Distances):
     with pytest.raises(ValueError):
         _core.construct(to_bytes(d), len(d), K, seeds=0)
     with pytest.raises(ValueError):
-        _core.optimize(to_bytes(d), len(d), [len(d)], 1.0)
+        _core.optimize(to_bytes(d), len(d), [len(d)])
     with pytest.raises(ValueError):
-        _core.optimize(to_bytes(d), len(d), [0], 1.0, runs=0)
+        _core.optimize(to_bytes(d), len(d), [0], runs=0)
 
 
 # CP-SAT
@@ -157,38 +191,47 @@ def test_verify_rejects_bad_covers(distances: Distances):
     assert not verify(distances, selected, tau, K - 1)
 
 
-def test_z3_lower_bound(distances: Distances, optimum: float):
-    assert verify_lower(distances, optimum, K, time_limit=60) == "proven"
-    assert verify_lower(distances, optimum + 1 / SCALE, K, time_limit=60) == "refuted"
+# Scenario and CLI
 
 
-def test_z3_cover_within_returns_a_valid_cover(distances: Distances, optimum: float):
-    d = scale(distances)
-    status, donors = z3_cover_within(d, round(optimum * SCALE), K, time_limit=60)
-    assert status == "refuted" and donors is not None
-    assert len(donors) <= K
-    assert radius(d, donors) <= round(optimum * SCALE)
+def test_scenario_defaults_when_tables_omitted(tmp_path: Path):
+    path = tmp_path / "scenario.toml"
+    path.write_text("")
+    assert Scenario.load(path) == Scenario(Data(), Solver())
 
 
-def test_z3_binary_search_reaches_optimum(distances: Distances, optimum: float):
-    _, upper, _ = solve_heuristic(distances, K, seeds=1)
-    lower, better = z3_lower_bound(distances, K, 0.0, upper, time_limit=120)
-    assert lower == optimum
-    if better is not None:
-        assert verify(distances, better, upper, K)
+def test_scenario_rejects_unknown_keys(tmp_path: Path):
+    path = tmp_path / "scenario.toml"
+    path.write_text("[solver]\nmax_iter = 10\n")
+    with pytest.raises(TypeError):
+        Scenario.load(path)
 
 
-# CLI
+def test_repo_scenario_is_valid():
+    """The checked-in scenario loads (no unknown keys) with usable settings."""
+    scenario = Scenario.load(Path(__file__).parent.parent / "scenario.toml")
+    data, solver = scenario.data, scenario.solver
+    assert 0 < solver.donors < data.parents
+    assert solver.seeds >= 1 and solver.runs >= 1 and solver.max_iters >= 1
+    assert 1 <= solver.scale <= 65_535
 
 
-@pytest.mark.parametrize("cpsat_time", ["0", "10"])
-def test_cli_reports_bounds(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], cpsat_time: str
+def test_cli_verifies_final_cover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
-    argv = ["donors", "--parents", "30", "--donors", "3", "--alns-time", "0.2"]
-    argv += ["--runs", "2", "--cpsat-time", cpsat_time, "--z3-time", "30"]
-    monkeypatch.setattr(sys, "argv", argv)
+    path = tmp_path / "scenario.toml"
+    path.write_text("""
+[data]
+parents = 30
+
+[solver]
+donors = 3
+runs = 2
+max_iters = 2_000
+patience = 500
+scale = 10_000
+""")
+    monkeypatch.setattr(sys, "argv", ["donors", str(path)])
     main()
     out = capsys.readouterr().out
     assert "z3: all parents covered within tau" in out
-    assert "optimal tau in [" in out

@@ -3,21 +3,23 @@
 Pick at most k donors from n recurrent parents so every parent lies within
 genetic distance tau of a selected donor, minimizing tau.
 
-Distances are scaled by SCALE and rounded, so tau is an integer and the
-answer is exact to 1 / SCALE.
+Distances are scaled by `scale` (the [solver] scale setting, default SCALE)
+and rounded, so tau is an integer and the answer is exact to 1 / scale.
 
 The heuristics run in Rust (donors._core): a multi-start greedy + swap
-construction, improved by parallel ALNS runs (upper bound). CP-SAT then
-solves a radius-level model restricted to a window just below it, stopping at
-a relative gap, to improve the cover and prove a lower bound (optional). Z3
-verifies each cover, checks CP-SAT's bound, and raises the lower bound by
-binary search.
+construction, improved by parallel ALNS runs limited by iterations and
+early-stopping patience. Z3 verifies the final cover. A CP-SAT model
+(solve_cpsat) is available for lower bounds but is not part of the pipeline.
 
-Usage: uv run donors [--help]
+Usage: uv run donors [scenario.toml]
 """
 
-import argparse
+import math
+import sys
 import time
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import z3
@@ -40,12 +42,12 @@ def get_distances(
     return 1 - similarity
 
 
-SCALE = 100  # distances are solved in integer units of 1 / SCALE
+SCALE = 100  # default: distances are solved in integer units of 1 / SCALE
 
 
-def scale(d: np.ndarray) -> np.ndarray:
-    """Integer distances in units of 1 / SCALE; at most SCALE + 1 distinct values."""
-    return np.rint(d * SCALE).astype(int)
+def to_units(d: np.ndarray, scale: int = SCALE) -> np.ndarray:
+    """Integer distances in units of 1 / scale; at most scale + 1 distinct values."""
+    return np.rint(d * scale).astype(int)
 
 
 def radius(d: np.ndarray, selected: list[int]) -> int:
@@ -72,10 +74,14 @@ def report(
     status: str,
     lower: float,
     seconds: float,
+    scale: int,
 ) -> tuple[list[int], float, float]:
-    """Print and return (selected donors, tau, proven lower bound on tau) in distance units."""
-    tau = d[:, selected].min(axis=1).max() / SCALE
-    lower /= SCALE
+    """Print and return (selected donors, tau, proven lower bound on tau) in distance units.
+
+    `d` and `lower` are in integer units of 1 / scale.
+    """
+    tau = d[:, selected].min(axis=1).max() / scale
+    lower /= scale
     print(
         f"{name}: status={status} tau={tau:.4f} lower bound={lower:.4f} time={seconds:.1f}s"
     )
@@ -196,6 +202,7 @@ def solve_cpsat(
     gap: float = 0.01,
     window: float = 0.05,
     time_limit: float = 120,
+    scale: int = SCALE,
 ) -> tuple[list[int], float, float]:
     """Improve `start` and prove a lower bound, searching just below its tau.
 
@@ -203,15 +210,15 @@ def solve_cpsat(
     where upper is the best tau found so far. If the optimum turns out to be
     at or below the window, the window is doubled and solved again. Stops
     each solve at relative gap `gap`. Returns (selected donors, tau, proven
-    lower bound on tau), to 1 / SCALE.
+    lower bound on tau), to 1 / scale.
     """
     t0 = time.perf_counter()
-    d = scale(d)
+    d = to_units(d, scale)
     floor = nn_lower_bound(d, k)
     best, upper = list(start), radius(d, start)
     while True:
         lower = max(int(upper * (1 - window)), floor - 1)
-        print(f"cp-sat window: [{lower / SCALE:.4f}, {upper / SCALE:.4f}]")
+        print(f"cp-sat window: [{lower / scale:.4f}, {upper / scale:.4f}]")
         selected, bound, status = solve_window(
             d, k, lower, upper, best, gap, time_limit
         )
@@ -225,7 +232,7 @@ def solve_cpsat(
             break
         window *= 2  # optimum is at or below the window: widen it downwards
     return report(
-        "cp-sat", d, best, status, max(bound, floor), time.perf_counter() - t0
+        "cp-sat", d, best, status, max(bound, floor), time.perf_counter() - t0, scale
     )
 
 
@@ -236,208 +243,134 @@ def to_bytes(d: np.ndarray) -> bytes:
 
 
 def solve_heuristic(
-    d: np.ndarray, k: int, seeds: int = 10, seed: int = 0
+    d: np.ndarray, k: int, seeds: int = 10, seed: int = 0, scale: int = SCALE
 ) -> tuple[list[int], float, float]:
     """Rust multi-start greedy + swap descent. Heuristic, no lower bound.
 
     Seed 0 is the plain greedy; the others start from distinct random first
     donors. Ties on tau are broken by fewer parents at tau.
     """
-    d = scale(d)
+    d = to_units(d, scale)
     result = _core.construct(to_bytes(d), len(d), k, seeds, seed)
-    return report(
-        "heuristic", d, result["donors"], f"best of {seeds} seeds", 0, result["wall"]
-    )
+    status = f"best of {seeds} seeds"
+    return report("heuristic", d, result["donors"], status, 0, result["wall"], scale)
 
 
 def solve_alns(
     d: np.ndarray,
     start: list[int],
-    time_limit: float = 60,
+    max_iters: int = 1_000_000,
+    patience: int = 100_000,
+    time_limit: float = math.inf,
     runs: int = 4,
     seed: int = 0,
+    scale: int = SCALE,
 ) -> tuple[list[int], float, float]:
     """Rust ALNS from `start` (k = len(start)): `runs` parallel searches, best kept.
 
+    Each run stops after `max_iters` iterations, `patience` iterations without
+    a new best (0 = off), or `time_limit` seconds, whichever comes first.
     Destroys a few donors per iteration (random, nearest the bottleneck parent,
     or related), repairs greedily with swap descent, and accepts by simulated
     annealing. Heuristic, no lower bound.
     """
-    d = scale(d)
+    d = to_units(d, scale)
     result = _core.optimize(
-        to_bytes(d), len(d), [int(i) for i in start], time_limit, seed, runs
+        to_bytes(d),
+        len(d),
+        [int(i) for i in start],
+        max_iters=max_iters,
+        patience=patience,
+        time_limit_s=time_limit,
+        seed=seed,
+        runs=runs,
     )
-    run_taus = ", ".join(f"{t / SCALE:.4f}" for t in result["run_taus"])
-    status = f"{result['iters']} iterations, run taus [{run_taus}]"
-    return report("alns", d, result["donors"], status, 0, result["wall"])
+    run_taus = ", ".join(f"{t / scale:.4f}" for t in result["run_taus"])
+    status = f"run iterations {result['run_iters']}, run taus [{run_taus}]"
+    return report("alns", d, result["donors"], status, 0, result["wall"], scale)
 
 
-def verify(d: np.ndarray, selected: list[int], tau: float, k: int) -> bool:
+def verify(
+    d: np.ndarray, selected: list[int], tau: float, k: int, scale: int = SCALE
+) -> bool:
     """Z3 check: at most k donors, and every parent has a selected donor within tau.
 
-    Compares in the same integer units of 1 / SCALE that the solvers use.
+    Compares in the same integer units of 1 / scale that the solvers use.
     """
-    d = scale(d)
+    d = to_units(d, scale)
     t = z3.Int("tau")
     s = z3.Solver()
-    s.add(t == round(tau * SCALE))
+    s.add(t == round(tau * scale))
     s.add(len(set(selected)) <= k)
     for j in range(len(d)):
         s.add(z3.Or([int(d[i, j]) <= t for i in selected]))
     return s.check() == z3.sat
 
 
-def verify_lower(d: np.ndarray, lower: float, k: int, time_limit: float = 300) -> str:
-    """Z3 check of a lower bound: no k donors cover every parent within lower - 1 / SCALE.
-
-    Returns "proven" (unsat), "refuted" (a better cover exists) or "unknown" (timed out).
-    """
-    return z3_cover_within(scale(d), round(lower * SCALE) - 1, k, time_limit)[0]
-
-
-def z3_cover_within(
-    d: np.ndarray, within: int, k: int, time_limit: float
-) -> tuple[str, list[int] | None]:
-    """Z3: can k donors cover every parent within scaled distance `within`?
-
-    Returns ("proven", None) if not (so optimal tau > within), ("refuted",
-    donors) with such a cover, or ("unknown", None) on timeout.
-    """
-    x = [z3.Bool(f"x{i}") for i in range(len(d))]  # donor i is selected
-    s = z3.Solver()
-    s.set("timeout", int(time_limit * 1000))
-    s.add(z3.AtMost(*x, k))
-    for j in range(len(d)):
-        s.add(z3.Or([x[i] for i in np.flatnonzero(d[:, j] <= within)]))
-    result = s.check()
-    if result == z3.unsat:
-        return "proven", None
-    if result == z3.sat:
-        model = s.model()
-        return "refuted", [i for i in range(len(d)) if z3.is_true(model.eval(x[i]))]
-    return "unknown", None
-
-
-def z3_lower_bound(
-    d: np.ndarray,
-    k: int,
-    lower: float,
-    upper: float,
-    time_limit: float = 300,
-    check_limit: float = 30,
-) -> tuple[float, list[int] | None]:
-    """Raise a proven lower bound on tau by binary search with Z3.
-
-    Starts from `lower` (already proven, raised to the nearest-neighbour
-    bound) and the cover tau `upper`. Each step asks whether k donors can
-    cover every parent below a probe: proven impossible raises the bound;
-    a cover found lowers the upper bound; a timeout searches lower probes.
-    Each check gets at most `check_limit` seconds, all of them `time_limit`.
-
-    Returns (proven lower bound on tau, better cover found or None).
-    """
-    d = scale(d)
-    lo = max(round(lower * SCALE), nn_lower_bound(d, k))  # optimal tau >= lo
-    hi = round(upper * SCALE)  # probes stay <= hi
-    better = None
-    deadline = time.perf_counter() + time_limit
-    while lo < hi and (remaining := deadline - time.perf_counter()) > 0:
-        probe = (lo + hi + 1) // 2  # try to prove optimal tau >= probe
-        t0 = time.perf_counter()
-        status, donors = z3_cover_within(d, probe - 1, k, min(check_limit, remaining))
-        print(
-            f"z3: tau >= {probe / SCALE:.4f}? {status} ({time.perf_counter() - t0:.1f}s)"
-        )
-        if status == "proven":
-            lo = probe
-        elif donors is not None:
-            better, hi = donors, radius(d, donors)
-        else:
-            hi = probe - 1
-    return lo / SCALE, better
-
-
-class Args(argparse.Namespace):
-    """Typed command-line options and their defaults."""
+@dataclass(frozen=True)
+class Data:
+    """Synthetic data: similarity ~ N(mu, sigma) clipped to [0, 1]."""
 
     parents: int = 1000
-    donors: int = 10
     mu: float = 0.7
     sigma: float = 0.08
-    data_seed: int = 42
+    seed: int = 42
+
+
+@dataclass(frozen=True)
+class Solver:
+    """Heuristic settings; each ALNS run stops at the first limit reached."""
+
+    donors: int = 10
     seeds: int = 10
-    alns_time: float = 60.0
     runs: int = 4
-    cpsat_time: float = 120.0
-    gap: float = 0.01
-    z3_time: float = 300.0
-    z3_check_time: float = 30.0
+    max_iters: int = 1_000_000
+    patience: int = 100_000
+    time_limit: float = math.inf
+    seed: int = 0
+    scale: int = SCALE  # distances solved in integer units of 1 / scale (<= 65 535)
 
 
-OPTIONS = {
-    "parents": "number of recurrent parents n",
-    "donors": "maximum donors k",
-    "mu": "mean similarity",
-    "sigma": "similarity standard deviation",
-    "data_seed": "seed for the synthetic data",
-    "seeds": "greedy construction starts",
-    "alns_time": "seconds per ALNS run",
-    "runs": "parallel ALNS runs",
-    "cpsat_time": "seconds per CP-SAT window (0 skips CP-SAT)",
-    "gap": "CP-SAT relative gap limit",
-    "z3_time": "seconds for the Z3 lower-bound search",
-    "z3_check_time": "seconds per Z3 check",
-}
+@dataclass(frozen=True)
+class Scenario:
+    """A scenario file: [data] and [solver] tables; omitted keys use defaults."""
+
+    data: Data = field(default_factory=Data)
+    solver: Solver = field(default_factory=Solver)
+
+    @classmethod
+    def load(cls, path: Path) -> "Scenario":
+        """Read a TOML scenario; unknown keys raise TypeError."""
+        cfg = tomllib.loads(path.read_text())
+        return cls(Data(**cfg.get("data", {})), Solver(**cfg.get("solver", {})))
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
-    for dest, text in OPTIONS.items():
-        default: int | float = getattr(Args, dest)
-        flag = "--" + dest.replace("_", "-")
-        p.add_argument(flag, type=type(default), help=f"{text} (default {default})")
-    args = p.parse_args(namespace=Args())
+    path = Path(sys.argv[1] if len(sys.argv) > 1 else "scenario.toml")
+    scenario = Scenario.load(path)
+    data, solver = scenario.data, scenario.solver
+    print(f"scenario {path}: {data}, {solver}")
 
-    k = args.donors
-    distances = get_distances(args.parents, args.mu, args.sigma, (0, 1), args.data_seed)
-
-    def check(name: str, selected: list[int], tau: float) -> None:
-        print(f"donors={sorted(selected)}, tau={tau:.4f}")
-        assert verify(distances, selected, tau, k), (
-            f"z3: {name} leaves a parent uncovered"
-        )
-        print("z3: all parents covered within tau")
-
-    heuristic, heuristic_tau, _ = solve_heuristic(distances, k, seeds=args.seeds)
-    check("heuristic", heuristic, heuristic_tau)
-    improved, improved_tau, _ = solve_alns(
-        distances, heuristic, time_limit=args.alns_time, runs=args.runs
+    distances = get_distances(data.parents, data.mu, data.sigma, (0, 1), data.seed)
+    start, start_tau, _ = solve_heuristic(
+        distances, solver.donors, seeds=solver.seeds, scale=solver.scale
     )
-    check("alns", improved, improved_tau)
-    print(f"alns tau is {1 - improved_tau / heuristic_tau:.1%} below the heuristic")
-    selected, tau, lower = improved, improved_tau, 0.0
-
-    if args.cpsat_time > 0:
-        selected, tau, lower = solve_cpsat(
-            distances, k, start=improved, gap=args.gap, time_limit=args.cpsat_time
-        )
-        check("cp-sat", selected, tau)
-        result = verify_lower(distances, lower, k, time_limit=args.z3_check_time)
-        assert result != "refuted", "z3: a cover below the cp-sat lower bound exists"
-        print(f"z3: cp-sat lower bound {lower:.4f} {result}")
-
-    lower, better = z3_lower_bound(
+    selected, tau, _ = solve_alns(
         distances,
-        k,
-        lower,
-        tau,
-        time_limit=args.z3_time,
-        check_limit=args.z3_check_time,
+        start,
+        max_iters=solver.max_iters,
+        patience=solver.patience,
+        time_limit=solver.time_limit,
+        runs=solver.runs,
+        seed=solver.seed,
+        scale=solver.scale,
     )
-    if better is not None:
-        selected, tau = better, radius(scale(distances), better) / SCALE
-        check("z3", selected, tau)
-    print(f"optimal tau in [{lower:.4f}, {tau:.4f}], gap {1 - lower / tau:.2%}")
+    print(f"alns tau is {1 - tau / start_tau:.1%} below the heuristic")
+    print(f"donors={sorted(selected)}, tau={tau:.4f}")
+    assert verify(distances, selected, tau, solver.donors, solver.scale), (
+        "z3: the final cover leaves a parent uncovered"
+    )
+    print("z3: all parents covered within tau")
 
 
 if __name__ == "__main__":

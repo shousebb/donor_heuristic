@@ -28,6 +28,8 @@ class OptimizeResult(TypedDict):
     """tau of the initial donors after swap descent."""
     iters: int
     """ALNS iterations summed over all runs."""
+    run_iters: list[int]
+    """Iterations of each run, in seed order."""
     wall: float
     """Seconds taken by the best run."""
     run_taus: list[int]
@@ -50,16 +52,20 @@ def optimize(
     dist: bytes,
     n: int,
     init: list[int],
-    time_limit_s: float,
+    max_iters: int = 1_000_000,
+    patience: int = 100_000,
+    time_limit_s: float = ...,
     seed: int = 0,
     runs: int = 1,
     config: dict[str, float] | None = None,
 ) -> OptimizeResult:
     """`runs` parallel ALNS searches from `init` (k = len(init)); returns the best.
 
-    Run r uses seed `seed + r` and runs for `time_limit_s` seconds. `config`
-    overrides tuning: segment, react, score_best, score_better, score_accept,
-    cooling, temp_factor, destroy_max.
+    Run r uses seed `seed + r` and stops after `max_iters` iterations,
+    `patience` iterations without a new best (0 = off), or `time_limit_s`
+    seconds (default: no limit), whichever comes first. `config` overrides
+    tuning: segment, react, score_best, score_better, score_accept, cooling,
+    temp_factor, destroy_max.
 
     Raises ValueError unless len(dist) == 2 * n * n, init holds 1..n-1 indices
     below n, and runs >= 1.

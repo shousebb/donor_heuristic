@@ -1,0 +1,50 @@
+version: "3"
+
+tasks:
+  default:
+    desc: Run all code quality checks and tests
+    cmds:
+      - task: check
+
+  check:
+    desc: Run all code quality checks and tests (lint, types, tests)
+    cmds:
+      - task: lint
+      - task: types
+      - task: test
+
+  lint:
+    desc: Python (ruff) and Rust (rustfmt, clippy) lint and format checks
+    cmds:
+      - uv run ruff check
+      - uv run ruff format --check
+      - cargo fmt --check
+      - cargo clippy --release -- -D warnings
+
+  types:
+    desc: Type check Python with ty and basedpyright
+    cmds:
+      - uv run ty check
+      - uv run basedpyright
+
+  test:
+    desc: Run the pytest suite (uv rebuilds the Rust extension if needed)
+    cmds:
+      - uv run pytest -q
+
+  fmt:
+    desc: Apply Python and Rust formatting and safe lint fixes
+    cmds:
+      - uv run ruff check --fix
+      - uv run ruff format
+      - cargo fmt
+
+  build:
+    desc: Rebuild and install the Rust extension into the venv
+    cmds:
+      - uv sync --reinstall-package donors
+
+  run:
+    desc: "Solve a scenario (default scenario.toml): task run -- other.toml"
+    cmds:
+      - uv run donors {{.CLI_ARGS}}

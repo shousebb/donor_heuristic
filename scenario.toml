@@ -1,0 +1,18 @@
+# Donor selection scenario: uv run donors [path/to/scenario.toml]
+# Omitted keys use the defaults shown here.
+
+[data]
+parents = 1000   # recurrent parents n
+mu = 0.7         # mean similarity; distance = 1 - similarity
+sigma = 0.06     # similarity standard deviation (clipped to [0, 1])
+seed = 42        # synthetic data seed
+
+[solver]
+donors = 10            # maximum donors k
+seeds = 10             # greedy construction starts
+runs = 4               # parallel ALNS runs, best kept
+max_iters = 1_000_000  # iterations per ALNS run
+patience = 100_000     # stop a run after this many iterations without a new best
+seed = 0               # ALNS seed (run r uses seed + r)
+scale = 1000            # distances solved in integer units of 1 / scale (100 -> 0.01; max 65_535)
+# time_limit = 600     # optional seconds per run (default: no limit)

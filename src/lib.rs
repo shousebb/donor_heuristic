@@ -232,7 +232,15 @@ struct Outcome {
     progress: Vec<(u64, u16, u16)>,
 }
 
-fn alns(dist: &Dist, init: Vec<usize>, time_limit_s: f64, seed: u64, cfg: &Config) -> Outcome {
+/// When an ALNS run stops: whichever limit is reached first.
+#[derive(Clone, Copy)]
+struct Limits {
+    max_iters: u64, // iteration cap
+    patience: u64,  // stop after this many iterations without a new best (0 = off)
+    time_s: f64,    // wall-clock cap in seconds
+}
+
+fn alns(dist: &Dist, init: Vec<usize>, limits: Limits, seed: u64, cfg: &Config) -> Outcome {
     let k = init.len();
     let mut rng = XorShiftRng::seed_from_u64(seed);
     // Energy for annealing: tau plus count as a fraction, preserving the lexicographic order
@@ -253,8 +261,13 @@ fn alns(dist: &Dist, init: Vec<usize>, time_limit_s: f64, seed: u64, cfg: &Confi
     let mut progress = Vec::new();
     let mut last_emit = 0.0;
     let mut it = 0u64;
-    while start.elapsed().as_secs_f64() < time_limit_s {
+    let mut since_best = 0u64;
+    while it < limits.max_iters && start.elapsed().as_secs_f64() < limits.time_s {
+        if limits.patience > 0 && since_best >= limits.patience {
+            break;
+        }
         it += 1;
+        since_best += 1;
         let q = 1 + rand_below(&mut rng, max_q);
 
         let total: f64 = weights.iter().sum();
@@ -274,6 +287,7 @@ fn alns(dist: &Dist, init: Vec<usize>, time_limit_s: f64, seed: u64, cfg: &Confi
         if delta <= 0.0 || rand_f64(&mut rng) < (-delta / temp).exp() {
             if new < best {
                 (best_sel, best) = (sel.clone(), new);
+                since_best = 0;
                 scores[op] += cfg.score_best;
             } else if new < cur {
                 scores[op] += cfg.score_better;
@@ -385,24 +399,36 @@ fn construct(
 }
 
 /// `runs` parallel ALNS searches (seeds seed..seed + runs) from the initial donors
-/// `init` (k = len(init)), each for `time_limit_s` seconds; returns the best.
+/// `init` (k = len(init)); returns the best. Each run stops after `max_iters`
+/// iterations, `patience` iterations without a new best (0 = off), or `time_limit_s`
+/// seconds, whichever comes first.
 ///
 /// `dist` is the n x n distance matrix as little-endian u16 bytes. Returns a dict with
-/// donors, tau, count (parents at tau), init_tau, iters (all runs), wall, run_taus and
-/// progress [(iteration, current tau, best tau)] of the best run.
+/// donors, tau, count (parents at tau), init_tau, iters (all runs), wall, run_taus,
+/// run_iters and progress [(iteration, current tau, best tau)] of the best run.
 #[pyfunction]
-#[pyo3(signature = (dist, n, init, time_limit_s, seed=0, runs=1, config=None))]
+#[pyo3(signature = (
+    dist, n, init, max_iters=1_000_000, patience=100_000, time_limit_s=f64::INFINITY,
+    seed=0, runs=1, config=None,
+))]
 #[allow(clippy::too_many_arguments)]
 fn optimize(
     py: Python<'_>,
     dist: &[u8],
     n: usize,
     init: Vec<usize>,
+    max_iters: u64,
+    patience: u64,
     time_limit_s: f64,
     seed: u64,
     runs: u64,
     config: Option<HashMap<String, f64>>,
 ) -> PyResult<PyObject> {
+    let limits = Limits {
+        max_iters,
+        patience,
+        time_s: time_limit_s,
+    };
     let dist = parse_dist(dist, n)?;
     if init.is_empty() || init.len() >= n || init.iter().any(|&i| i >= n) || runs == 0 {
         return Err(PyValueError::new_err(
@@ -415,14 +441,15 @@ fn optimize(
             let handles: Vec<_> = (0..runs)
                 .map(|r| {
                     let (dist, cfg, init) = (&dist, &cfg, init.clone());
-                    s.spawn(move || alns(dist, init, time_limit_s, seed + r, cfg))
+                    s.spawn(move || alns(dist, init, limits, seed + r, cfg))
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         })
     });
     let run_taus: Vec<u16> = outcomes.iter().map(|o| o.score.0).collect();
-    let iters: u64 = outcomes.iter().map(|o| o.iters).sum();
+    let run_iters: Vec<u64> = outcomes.iter().map(|o| o.iters).collect();
+    let iters: u64 = run_iters.iter().sum();
     let best = outcomes.into_iter().min_by_key(|o| o.score).unwrap();
 
     let dict = pyo3::types::PyDict::new(py);
@@ -431,6 +458,7 @@ fn optimize(
     dict.set_item("count", best.score.1)?;
     dict.set_item("init_tau", best.init_tau)?;
     dict.set_item("iters", iters)?;
+    dict.set_item("run_iters", run_iters)?;
     dict.set_item("wall", best.wall)?;
     dict.set_item("run_taus", run_taus)?;
     dict.set_item("progress", best.progress)?;

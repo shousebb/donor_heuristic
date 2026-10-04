@@ -7,37 +7,39 @@ most `k` donors from the recurrent parents so that every recurrent parent is wit
 genetic distance `tau` of a selected donor, minimizing `tau`. This is the discrete
 k-center problem.
 
-Distances are solved in integer units of `1 / SCALE` (set in `donor.py`; 100 gives
-0.01, 10 000 gives 1e-4), so `tau` is exact to that resolution. A coarser `SCALE` merges
-near-equal distances, which shrinks the CP-SAT model and the Z3 checks.
+Distances are solved in integer units of `1 / scale`, set by `[solver] scale` in the
+scenario (default 100 gives 0.01; 10 000 gives 1e-4; at most 65 535), so `tau` is exact
+to that resolution. A coarser scale merges near-equal distances into fewer distinct
+values.
 
 ## Example data
 
 Synthetic genetic distances are `1 - similarity`, with similarity drawn from
 `N(mu, sigma)`, clipped to `[0, 1]`, symmetric, and 1 on the diagonal:
 
-- 1000 recurrent parents by default (`--parents`; up to about 2000)
-- at most 10 donors (`--donors`; 5 to 20 expected)
-- similarity mean 0.7 (`--mu`), standard deviation 0.08 (`--sigma`)
+- 1000 recurrent parents by default (`[data] parents`; up to about 2000)
+- at most 10 donors (`[solver] donors`; 5 to 20 expected)
+- similarity mean 0.7 (`mu`), standard deviation 0.08 (`sigma`)
 
 Independent random distances are the hardest case for proving optimality: there is no
 cluster structure, so many donor sets are nearly as good as the best.
 
 ## Approach
 
-1. **Construction (Rust):** greedy donor selection plus swap descent from `--seeds`
+1. **Construction (Rust):** greedy donor selection plus swap descent from `seeds`
    starts; the best is kept.
-2. **ALNS (Rust):** `--runs` parallel adaptive large neighbourhood searches for
-   `--alns-time` seconds. Each iteration removes 1 to 3 donors (random, nearest the
-   parent at `tau`, or mutually close), repairs greedily, runs swap descent, and
-   accepts by simulated annealing. This gives the upper bound.
-3. **CP-SAT (optional):** a radius-level model restricted to a window just below the
-   best `tau`, warm-started from it and stopped at relative gap `--gap`. It can
-   improve the cover and prove a lower bound. Skip it with `--cpsat-time 0`.
-4. **Z3:** verifies every cover, checks CP-SAT's lower bound, then raises the lower
-   bound by binary search (`--z3-time` in total, `--z3-check-time` per check).
+2. **ALNS (Rust):** `runs` parallel adaptive large neighbourhood searches. Each
+   iteration removes 1 to 3 donors (random, nearest the parent at `tau`, or mutually
+   close), repairs greedily, runs swap descent, and accepts by simulated annealing.
+   Each run stops after `max_iters` iterations (default 1 000 000) or `patience`
+   iterations without a new best (default 100 000), whichever comes first; an
+   optional `time_limit` caps its seconds.
+3. **Z3:** verifies that the final cover uses at most `donors` donors and covers every
+   parent within `tau`.
 
-The run ends with `optimal tau in [lower, upper], gap ...`.
+The heuristics give an upper bound only. A CP-SAT radius-level model
+(`solve_cpsat`) remains in `donor.py` for lower bounds but is not part of the
+pipeline.
 
 ## Usage
 
@@ -45,20 +47,40 @@ Requires Python 3.13+, [uv](https://docs.astral.sh/uv/) and a Rust toolchain; `u
 builds the Rust extension automatically.
 
 ```bash
-uv run donors                    # n = 1000, k = 10
-uv run donors --cpsat-time 0     # heuristics + Z3 lower bound only
-uv run donors --help             # all options
+uv run donors                    # reads ./scenario.toml
+uv run donors my_scenario.toml   # another scenario
+```
+
+A scenario has a `[data]` and a `[solver]` table; omitted keys use the defaults and
+unknown keys are an error. See `scenario.toml`:
+
+```toml
+[data]
+parents = 1000   # recurrent parents n
+mu = 0.7         # mean similarity; distance = 1 - similarity
+sigma = 0.08     # similarity standard deviation (clipped to [0, 1])
+seed = 42        # synthetic data seed
+
+[solver]
+donors = 10            # maximum donors k
+seeds = 10             # greedy construction starts
+runs = 4               # parallel ALNS runs, best kept
+max_iters = 1_000_000  # iterations per ALNS run
+patience = 100_000     # stop a run after this many iterations without a new best
+seed = 0               # ALNS seed (run r uses seed + r)
+scale = 100            # distances solved in integer units of 1 / scale (100 -> 0.01; max 65_535)
+# time_limit = 600     # optional seconds per run (default: no limit)
 ```
 
 From Python:
 
 ```python
-from donors.donor import get_distances, solve_heuristic, solve_alns, z3_lower_bound
+from donors.donor import get_distances, solve_alns, solve_heuristic, verify
 
 d = get_distances(n=2000, mu=0.7, sigma=0.08, bounds=(0, 1))
 start, _, _ = solve_heuristic(d, k=10)
-donors, tau, _ = solve_alns(d, start, time_limit=60, runs=4)
-lower, better = z3_lower_bound(d, 10, 0.0, tau)
+donors, tau, _ = solve_alns(d, start, max_iters=1_000_000, patience=100_000)
+assert verify(d, donors, tau, k=10)
 ```
 
 ## Results (n = 2000, k = 10)
@@ -68,16 +90,17 @@ lower, better = z3_lower_bound(d, 10, 0.0, tau)
 | Python multi-start greedy + swap, 1000 starts | 0.2667 |
 | Rust ALNS, 60 s, single run | 0.2628 to 0.2660 |
 
-The lower bound is the weak side. Bounds based on the linear relaxation can prove at
-most about 0.2066 on this data, so expect a gap above 20%. On 300 parents, the Z3
-search proved `tau >= 0.1423` against a cover at 0.2319.
+Measured at `scale = 10_000` before the iteration and patience limits. Lower bounds
+are weak on this data: bounds based on the linear relaxation can prove at most about
+0.2066, so the gap to the best cover is above 20%.
 
 ## Layout
 
 ```
 Cargo.toml, src/lib.rs        Rust extension donors._core: construct, optimize
 python/donors/_core.pyi       type stubs for the extension
-python/donors/donor.py        data, CP-SAT, Z3, wrappers and CLI (donors)
+python/donors/donor.py        data, scenario, wrappers, Z3 check, CLI (donors)
+scenario.toml                 default scenario
 tests/test_donors.py          pytest suite
 reference/donor.py            earlier SCIP big-M model (reference only)
 ```
