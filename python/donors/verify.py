@@ -1,8 +1,8 @@
-"""Checks that a donor set covers every parent within tau (integer units)."""
+"""Cover checks: a fast numpy check and an independent CP-SAT one (integer units)."""
 
 import numpy as np
-import z3
 
+from .cpsat import check_tau
 from .distances import radius
 
 
@@ -11,12 +11,11 @@ def covers(d: np.ndarray, selected: list[int], tau: int, k: int) -> bool:
     return len(set(selected)) <= k and radius(d, selected) <= tau
 
 
-def verify(d: np.ndarray, selected: list[int], tau: int, k: int) -> bool:
-    """The same check as `covers`, proved independently by Z3."""
-    t = z3.Int("tau")
-    s = z3.Solver()
-    s.add(t == tau)
-    s.add(len(set(selected)) <= k)
-    for j in range(len(d)):
-        s.add(z3.Or([int(d[i, j]) <= t for i in selected]))
-    return s.check() == z3.sat
+def verify(
+    d: np.ndarray, selected: list[int], tau: int, k: int, timeout: float = 60
+) -> bool:
+    """The same check as `covers`, proved independently by a CP-SAT model."""
+    return (
+        len(set(selected)) <= k
+        and check_tau(d, k, tau, timeout, donors=selected).result == "feasible"
+    )

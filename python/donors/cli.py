@@ -4,7 +4,8 @@ Usage: uv run donors [scenario.toml]
 
 Builds synthetic distances, runs the Rust heuristics (greedy + swap
 construction, then parallel ALNS), checks every donor set found at the best
-tau (Z3 proves the best one), and writes the scenario and result to
+tau (a CP-SAT model confirms the best one), optionally searches for a lower
+tau with CP-SAT (cpsat_search), and writes the scenario and result to
 outputs/<scenario stem>_<YYYYMMDD>/result_<HHMMSS>.json.
 """
 
@@ -16,6 +17,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
+from .cpsat import Check, descend
 from .distances import SCALE, get_distances, to_units
 from .heuristics import solve_alns, solve_heuristic
 from .verify import covers, verify
@@ -54,6 +58,9 @@ class Solver:
     seed: int = 0
     scale: int = SCALE  # distances solved in integer units of 1 / scale (<= 65 535)
     max_sets: int = 10  # distinct donor sets to report at the best tau
+    cpsat_search: bool = False  # after ALNS, lower tau by 1 with CP-SAT until one fails
+    cpsat_timeout: float = 30  # stop the CP-SAT search when a check takes longer (s)
+    cpsat_log: bool = False  # print CP-SAT's search progress during the search
 
     def __post_init__(self) -> None:
         _require(
@@ -67,6 +74,7 @@ class Solver:
                 "seed >= 0": self.seed >= 0,
                 "1 <= scale <= 65535": 1 <= self.scale <= 65_535,
                 "max_sets >= 1": self.max_sets >= 1,
+                "cpsat_timeout > 0": self.cpsat_timeout > 0,
             }
         )
 
@@ -161,22 +169,63 @@ def main() -> None:
         if not covers(d, donors, best.tau, solver.donors):
             raise RuntimeError(f"donor set {donors} leaves a parent uncovered")
     if not verify(d, best.donors, best.tau, solver.donors):
-        raise RuntimeError("z3: the best donor set leaves a parent uncovered")
-    print("every set covers all parents within tau; z3 confirms the best")
+        raise RuntimeError("cp-sat: the best donor set leaves a parent uncovered")
+    print("every set covers all parents within tau; cp-sat confirms the best")
 
-    out = write_output(
-        path,
-        scenario,
-        {
-            "heuristic_tau": start.tau / scale,
-            "tau": tau,
-            "sets": [
-                {"donors": donors, "parents_at_tau": count}
-                for donors, count in zip(best.sets, best.counts, strict=True)
-            ],
-        },
-    )
+    result: dict[str, object] = {
+        "heuristic_tau": start.tau / scale,
+        "tau": tau,
+        "sets": [
+            {"donors": donors, "parents_at_tau": count}
+            for donors, count in zip(best.sets, best.counts, strict=True)
+        ],
+    }
+    if solver.cpsat_search:
+        result["cpsat_search"] = cpsat_search(
+            d, solver.donors, best.tau, best.donors, solver
+        )
+    out = write_output(path, scenario, result)
     print(f"wrote {out}")
+
+
+def cpsat_search(
+    d: np.ndarray, k: int, tau: int, donors: list[int], solver: Solver
+) -> dict[str, object]:
+    """Run and print the CP-SAT descent from `donors` at tau; return its summary."""
+    scale = solver.scale
+    print(
+        f"cp-sat search from tau={tau / scale:.4f}, {solver.cpsat_timeout:g}s per check:"
+    )
+    checks = descend(d, k, tau, solver.cpsat_timeout, donors, solver.cpsat_log)
+    for c in checks:
+        print(f"  tau={c.tau / scale:.4f}: {c.result} in {c.seconds:.1f}s")
+    lowest: Check | None = None  # the last feasible check: the lowest tau with a cover
+    for c in checks:
+        if c.donors is not None:
+            if not covers(d, c.donors, c.tau, k):
+                raise RuntimeError(
+                    f"cp-sat: cover at tau={c.tau} leaves a parent uncovered"
+                )
+            lowest = c
+    optimal = checks[-1].result == "infeasible" and lowest is not None
+    if lowest is None:
+        print("  cp-sat found no cover within the time limit")
+    elif optimal:
+        print(
+            f"  tau={lowest.tau / scale:.4f} is optimal: cp-sat proved nothing lower exists"
+        )
+    else:
+        print(f"  lowest tau reached {lowest.tau / scale:.4f}, not proven optimal")
+    return {
+        "timeout": solver.cpsat_timeout,
+        "checks": [
+            {"tau": c.tau / scale, "result": c.result, "seconds": round(c.seconds, 3)}
+            for c in checks
+        ],
+        "tau": None if lowest is None else lowest.tau / scale,
+        "donors": None if lowest is None else lowest.donors,
+        "optimal": optimal,
+    }
 
 
 if __name__ == "__main__":

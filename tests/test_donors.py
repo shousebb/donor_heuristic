@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from donors import _core
 from donors.cli import Data, Scenario, Solver, main, write_output
-from donors.cpsat import nn_lower_bound, solve_cpsat
+from donors.cpsat import check_tau, descend, nn_lower_bound, solve_cpsat
 from donors.distances import (
     SCALE,
     get_distances,
@@ -260,6 +260,7 @@ def test_scenario_rejects_unknown_keys(tmp_path: Path):
     ("toml", "message"),
     [
         ("[solver]\nmax_sets = 0", "max_sets >= 1"),
+        ("[solver]\ncpsat_timeout = 0", "cpsat_timeout > 0"),
         ("[solver]\nscale = 70_000", "scale"),
         ("[solver]\nruns = 0\nseeds = 0", "seeds >= 1, runs >= 1"),
         ("[data]\nparents = 10\n[solver]\ndonors = 10", "donors < parents"),
@@ -306,12 +307,13 @@ max_iters = 2_000
 patience = 500
 scale = 10_000
 max_sets = 5
+cpsat_search = true
 """)
     monkeypatch.setattr(sys, "argv", ["donors", str(path)])
     monkeypatch.chdir(tmp_path)
     main()
     out = capsys.readouterr().out
-    assert "every set covers all parents within tau; z3 confirms the best" in out
+    assert "every set covers all parents within tau; cp-sat confirms the best" in out
 
     (result_file,) = (tmp_path / "outputs").glob("scenario_*/result_*.json")
     saved = json.loads(result_file.read_text())
@@ -322,3 +324,53 @@ max_sets = 5
     assert 1 <= len(sets) <= 5
     counts = [s["parents_at_tau"] for s in sets]
     assert counts == sorted(counts) and counts[0] >= 1
+
+    search = result["cpsat_search"]
+    assert search["optimal"] and search["checks"][-1]["result"] == "infeasible"
+    assert search["tau"] <= result["tau"]
+    assert "is optimal: cp-sat proved nothing lower exists" in out
+
+
+# CP-SAT search
+
+
+def test_descend_proves_optimum_from_heuristic(d: Units, optimum: int):
+    start = solve_heuristic(d, K, seeds=1)
+    checks = descend(d, K, start.tau)
+    assert [c.tau for c in checks] == list(range(start.tau, optimum - 2, -1))
+    feasible = ["feasible"] * (start.tau - optimum + 1)
+    assert [c.result for c in checks] == [*feasible, "infeasible"]
+    for c in checks[:-1]:
+        assert c.donors is not None and covers(d, c.donors, c.tau, K)
+    assert checks[-1].donors is None
+    assert all(c.seconds >= 0 for c in checks)
+
+
+def test_descend_confirms_given_donors_first(d: Units, optimum: int):
+    start = solve_heuristic(d, K, seeds=1)
+    checks = descend(d, K, start.tau, donors=start.donors)
+    assert checks[0].donors == start.donors
+    assert checks[-1].result == "infeasible" and checks[-1].tau == optimum - 1
+
+
+def test_check_tau_with_fixed_donors_rejects_a_non_cover(d: Units):
+    start = solve_heuristic(d, K)
+    check = check_tau(d, K, start.tau - 1, timeout=10, donors=start.donors)
+    assert check.result == "infeasible"
+
+
+def test_check_tau_gives_up_after_timeout():
+    d = to_units(get_distances(400, 0.7, 0.06, (0, 1), seed=2), 1000)
+    start = solve_heuristic(d, 10, seeds=1)
+    check = check_tau(d, 10, start.tau - 30, timeout=0.01)
+    assert check.result == "unknown" and check.donors is None
+
+
+def test_check_tau_logs_search_progress_only_when_asked(
+    d: Units, capfd: pytest.CaptureFixture[str]
+):
+    start = solve_heuristic(d, K)
+    check_tau(d, K, start.tau, timeout=10)
+    assert "CP-SAT solver" not in capfd.readouterr().out
+    check_tau(d, K, start.tau, timeout=10, log=True)
+    assert "CP-SAT solver" in capfd.readouterr().out

@@ -2,18 +2,21 @@
 # Omitted keys use the defaults shown here.
 
 [data]
-parents = 1_000  # recurrent parents n
+parents = 200  # recurrent parents n
 mu = 0.7         # mean similarity; distance = 1 - similarity
 sigma = 0.06     # similarity standard deviation (clipped to [0, 1])
 seed = 42        # synthetic data seed
 
 [solver]
-donors = 10            # maximum donors k
+donors = 10           # maximum donors k
 seeds = 10             # greedy construction starts
 runs = 4               # parallel ALNS runs, best kept
-max_iters = 1_000_000  # iterations per ALNS run
-patience = 100_000     # stop a run after this many iterations without a new best
+max_iters = 100_000  # iterations per ALNS run
+patience = 20_000     # stop a run after this many iterations without a new best
 seed = 0               # ALNS seed (run r uses seed + r)
-scale = 1_000          # distances solved in integer units of 1 / scale (100 -> 0.01; max 65_535)
+scale = 10_000          # distances solved in integer units of 1 / scale (100 -> 0.01; max 65_535)
 max_sets = 10          # distinct donor sets to report at the best tau
+cpsat_search = true   # after ALNS, check tau, tau - 1, ... with CP-SAT until one fails
+cpsat_timeout = 300     # stop the CP-SAT search when a check takes longer (seconds)
+cpsat_log = false      # print CP-SAT's search progress during the search
 # time_limit = 600     # optional seconds per run (default: no limit)

@@ -38,7 +38,15 @@ cluster structure, so many donor sets are nearly as good as the best.
    merged and the best `max_sets` reported, fewest parents at `tau` first (a set with
    fewer parents exactly at `tau` is closer to a lower `tau`).
 3. **Check:** every reported set is checked to use at most `donors` donors and cover
-   every parent within `tau`; Z3 independently proves it for the best set.
+   every parent within `tau`; a CP-SAT model with the donors fixed independently
+   confirms the best set.
+4. **CP-SAT search (optional, `cpsat_search = true`):** asks CP-SAT whether any
+   `donors` parents cover everyone within `tau - 1`, `tau - 2`, ... (integer units),
+   each check warm-started from the last cover. A feasible check gives a better
+   cover; an infeasible check proves the last feasible `tau` optimal. The search stops
+   at the first infeasible check or the first that takes longer than `cpsat_timeout`
+   seconds (default 30). Each check's `tau`, result and time are printed and saved;
+   `cpsat_log = true` also prints CP-SAT's own search log for every check.
 
 The heuristics give an upper bound only. A CP-SAT radius-level model
 (`solve_cpsat` in `cpsat.py`) remains for lower bounds but is not part of the
@@ -80,6 +88,9 @@ patience = 100_000     # stop a run after this many iterations without a new bes
 seed = 0               # ALNS seed (run r uses seed + r)
 scale = 100            # distances solved in integer units of 1 / scale (100 -> 0.01; max 65_535)
 max_sets = 10          # distinct donor sets to report at the best tau
+cpsat_search = false   # after ALNS, check tau, tau - 1, ... with CP-SAT until one fails
+cpsat_timeout = 30     # stop the CP-SAT search when a check takes longer (seconds)
+cpsat_log = false      # print CP-SAT's search progress during the search
 # time_limit = 600     # optional seconds per run (default: no limit)
 ```
 
@@ -119,8 +130,8 @@ src/lib.rs                    Python bindings donors._core: construct, optimize
 python/donors/_core.pyi       type stubs for the extension
 python/donors/distances.py    synthetic distances, integer units, radius
 python/donors/heuristics.py   wrappers for the Rust heuristics
-python/donors/cpsat.py        CP-SAT radius-level model (lower bounds)
-python/donors/verify.py       cover checks: numpy and Z3
+python/donors/cpsat.py        CP-SAT: cover checks, downward search, lower-bound model
+python/donors/verify.py       cover checks: numpy and CP-SAT
 python/donors/solution.py     Solution returned by every solver
 python/donors/cli.py          scenario, result output, CLI (donors)
 scripts/measure_windows.py    CP-SAT model size per tau window

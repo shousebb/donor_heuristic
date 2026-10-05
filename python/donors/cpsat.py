@@ -1,9 +1,12 @@
-"""CP-SAT radius-level model for lower bounds (not part of the CLI pipeline).
+"""CP-SAT models on the n x n matrix of integer distances from distances.to_units.
 
-Takes the n x n matrix of integer distances from distances.to_units.
+check_tau / descend: does a cover within a given tau exist? Used by the CLI to
+confirm the best cover and, optionally, to search downwards from the ALNS tau.
+solve_cpsat: radius-level model for lower bounds (not part of the CLI pipeline).
 """
 
 import time
+from dataclasses import dataclass
 
 import numpy as np
 from ortools.sat.python import cp_model
@@ -32,6 +35,7 @@ def solve_window(
     start: list[int],
     gap: float,
     time_limit: float,
+    log: bool = False,
 ) -> tuple[list[int], int, str]:
     """Radius-level model with tau restricted to [lower, upper].
 
@@ -117,7 +121,7 @@ def solve_window(
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
     solver.parameters.relative_gap_limit = gap
-    solver.parameters.log_search_progress = True
+    solver.parameters.log_search_progress = log
     solver.parameters.num_workers = 8
     status = solver.solve(m)
 
@@ -138,13 +142,14 @@ def solve_cpsat(
     gap: float = 0.01,
     window: float = 0.05,
     time_limit: float = 120,
+    log: bool = False,
 ) -> Solution:
     """Improve `start` and prove a lower bound, searching just below its tau.
 
     Solves the radius-level model on the window [upper * (1 - window), upper],
     where upper is the best tau found so far. If the optimum turns out to be
     at or below the window, the window is doubled and solved again. Stops
-    each solve at relative gap `gap`.
+    each solve at relative gap `gap`. `log` prints CP-SAT's search progress.
     """
     t0 = time.perf_counter()
     floor = nn_lower_bound(d, k)
@@ -152,7 +157,7 @@ def solve_cpsat(
     while True:
         lower = max(int(upper * (1 - window)), floor - 1)
         selected, bound, status = solve_window(
-            d, k, lower, upper, best, gap, time_limit
+            d, k, lower, upper, best, gap, time_limit, log
         )
         found = radius(d, selected)
         if found < upper:
@@ -174,3 +179,87 @@ def solve_cpsat(
         sets=[best],
         counts=[count],
     )
+
+
+@dataclass(frozen=True)
+class Check:
+    """One CP-SAT check: can at most k donors cover every parent within tau?"""
+
+    tau: int
+    result: str  # "feasible" (donors found), "infeasible" or "unknown" (timed out)
+    seconds: float  # time spent solving, excluding model construction
+    donors: list[int] | None  # a cover at tau when feasible
+
+
+def check_tau(
+    d: np.ndarray,
+    k: int,
+    tau: int,
+    timeout: float,
+    donors: list[int] | None = None,
+    hint: list[int] | None = None,
+    log: bool = False,
+) -> Check:
+    """Search all selections of at most k donors for a cover within tau, with CP-SAT.
+
+    x[i] selects parent i as a donor; each parent needs a selected donor within
+    tau. Gives up after `timeout` seconds with result "unknown". Given `donors`,
+    checks only that exact selection. `hint` warm-starts the search; `log` prints
+    CP-SAT's search progress.
+    """
+    n = len(d)
+    m = cp_model.CpModel()
+    x = [m.new_bool_var(f"x{i}") for i in range(n)]
+    m.add(sum(x) <= k)
+    for j in range(n):
+        m.add_bool_or([x[i] for i in np.flatnonzero(d[:, j] <= tau)])
+    if donors is not None:
+        chosen = set(donors)
+        for i in range(n):
+            m.add(x[i] == int(i in chosen))
+    if hint is not None:
+        hinted = set(hint)
+        for i in range(n):
+            m.add_hint(x[i], i in hinted)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = timeout
+    solver.parameters.num_workers = 8
+    solver.parameters.log_search_progress = log
+    t0 = time.perf_counter()
+    status = solver.solve(m)
+    seconds = time.perf_counter() - t0
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        found = [i for i in range(n) if solver.value(x[i])]
+        return Check(tau, "feasible", seconds, found)
+    result = "infeasible" if status == cp_model.INFEASIBLE else "unknown"
+    return Check(tau, result, seconds, None)
+
+
+def descend(
+    d: np.ndarray,
+    k: int,
+    tau: int,
+    timeout: float = 30,
+    donors: list[int] | None = None,
+    log: bool = False,
+) -> list[Check]:
+    """Check tau, tau - 1, ... with CP-SAT until one is not feasible or exceeds `timeout`.
+
+    If the last check is infeasible, its tau + 1 is proven optimal; every
+    feasible check gives a cover at its tau. A check that runs past `timeout`
+    seconds ends the search, normally with result "unknown". `donors`, a known
+    cover at tau, makes the first check confirm it instead of searching (an
+    infeasible first check then means `donors` is not a cover); each later
+    check is warm-started from the last cover found. `log` prints CP-SAT's
+    search progress for every check.
+    """
+    checks: list[Check] = []
+    last = donors
+    for t in range(tau, -1, -1):
+        check = check_tau(d, k, t, timeout, donors if t == tau else None, last, log)
+        checks.append(check)
+        if check.result != "feasible" or check.seconds > timeout:
+            break
+        last = check.donors
+    return checks
